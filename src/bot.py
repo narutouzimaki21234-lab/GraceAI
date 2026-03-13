@@ -1,10 +1,18 @@
 import os
 import asyncio
+import importlib
+import json
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
+from urllib.request import urlopen
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
@@ -22,6 +30,16 @@ GLOBAL_RPM_LIMIT = max(1, int(os.getenv("GLOBAL_RPM_LIMIT", "4")))
 USER_COOLDOWN_SEC = max(1.0, float(os.getenv("USER_COOLDOWN_SEC", "8")))
 MAX_IMAGE_BYTES = max(1, int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024))))
 MAX_IMAGES_PER_REQUEST = max(1, int(os.getenv("MAX_IMAGES_PER_REQUEST", "3")))
+HISTORY_MAX_TURNS = max(1, int(os.getenv("HISTORY_MAX_TURNS", "6")))
+CHANNEL_HISTORY_MESSAGES = max(0, int(os.getenv("CHANNEL_HISTORY_MESSAGES", "6")))
+WEATHER_DEFAULT_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Jakarta")
+NEWS_MAX_ITEMS = max(1, min(10, int(os.getenv("NEWS_MAX_ITEMS", "5"))))
+NEWS_REGION_LANGUAGE = os.getenv("NEWS_REGION_LANGUAGE", "id")
+NEWS_REGION_COUNTRY = os.getenv("NEWS_REGION_COUNTRY", "ID")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+HISTORY_BACKEND = os.getenv("HISTORY_BACKEND", "auto").strip().lower()
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+HISTORY_STORE_PATH = DATA_DIR / "conversation_history.json"
 
 IDENTITY_TEXT = (
     "Saya adalah Grace, asisten AI DPNP yang dibuat oleh Brann. "
@@ -55,6 +73,518 @@ class ImagePayload:
     data: bytes
     mime_type: str
     filename: str
+
+
+conversation_history: dict[str, deque[dict[str, str]]] = {}
+history_lock = asyncio.Lock()
+
+
+def _resolve_history_backend() -> str:
+    if HISTORY_BACKEND in {"file", "postgres"}:
+        if HISTORY_BACKEND == "postgres" and not DATABASE_URL:
+            return "file"
+        return HISTORY_BACKEND
+    if DATABASE_URL:
+        return "postgres"
+    return "file"
+
+
+ACTIVE_HISTORY_BACKEND = _resolve_history_backend()
+
+
+def _ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_history_store_sync() -> dict[str, deque[dict[str, str]]]:
+    _ensure_data_dir()
+    if not HISTORY_STORE_PATH.exists():
+        return {}
+
+    try:
+        with HISTORY_STORE_PATH.open("r", encoding="utf-8") as file:
+            raw_data = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    histories: dict[str, deque[dict[str, str]]] = {}
+    if not isinstance(raw_data, dict):
+        return histories
+
+    for key, turns in raw_data.items():
+        if not isinstance(key, str) or not isinstance(turns, list):
+            continue
+        cleaned_turns: list[dict[str, str]] = []
+        for turn in turns[-HISTORY_MAX_TURNS:]:
+            if not isinstance(turn, dict):
+                continue
+            user_text = str(turn.get("user", "")).strip()
+            bot_text = str(turn.get("bot", "")).strip()
+            if not user_text or not bot_text:
+                continue
+            cleaned_turns.append({"user": user_text, "bot": bot_text})
+        if cleaned_turns:
+            histories[key] = deque(cleaned_turns, maxlen=HISTORY_MAX_TURNS)
+    return histories
+
+
+def _save_history_store_sync(histories: dict[str, deque[dict[str, str]]]) -> None:
+    _ensure_data_dir()
+    serializable = {
+        key: list(turns)[-HISTORY_MAX_TURNS:]
+        for key, turns in histories.items()
+        if turns
+    }
+    with HISTORY_STORE_PATH.open("w", encoding="utf-8") as file:
+        json.dump(serializable, file, ensure_ascii=False, indent=2)
+
+
+def _get_postgres_connection() -> Any:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL belum diisi.")
+    try:
+        psycopg_module = importlib.import_module("psycopg")
+    except ImportError as exc:
+        raise RuntimeError("psycopg belum terpasang.") from exc
+    return psycopg_module.connect(DATABASE_URL)
+
+
+def _init_postgres_history_sync() -> None:
+    with _get_postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_history (
+                    turn_id BIGSERIAL PRIMARY KEY,
+                    conversation_key TEXT NOT NULL,
+                    user_text TEXT NOT NULL,
+                    bot_text TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_history_key_turn_id
+                ON conversation_history (conversation_key, turn_id DESC)
+                """
+            )
+        connection.commit()
+
+
+def _load_postgres_history_sync() -> dict[str, deque[dict[str, str]]]:
+    histories: dict[str, deque[dict[str, str]]] = {}
+    with _get_postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT conversation_key, user_text, bot_text
+                FROM (
+                    SELECT
+                        conversation_key,
+                        user_text,
+                        bot_text,
+                        turn_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY conversation_key
+                            ORDER BY turn_id DESC
+                        ) AS row_num
+                    FROM conversation_history
+                ) ranked
+                WHERE row_num <= %s
+                ORDER BY conversation_key, turn_id ASC
+                """,
+                (HISTORY_MAX_TURNS,),
+            )
+            for conversation_key, user_text, bot_text in cursor.fetchall():
+                turns = histories.setdefault(
+                    conversation_key,
+                    deque(maxlen=HISTORY_MAX_TURNS),
+                )
+                turns.append({
+                    "user": str(user_text).strip(),
+                    "bot": str(bot_text).strip(),
+                })
+    return histories
+
+
+def _save_postgres_turn_sync(conversation_key: str, user_text: str, bot_text: str) -> None:
+    with _get_postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO conversation_history (conversation_key, user_text, bot_text)
+                VALUES (%s, %s, %s)
+                """,
+                (conversation_key, user_text, bot_text),
+            )
+            cursor.execute(
+                """
+                DELETE FROM conversation_history
+                WHERE conversation_key = %s
+                  AND turn_id NOT IN (
+                      SELECT turn_id
+                      FROM conversation_history
+                      WHERE conversation_key = %s
+                      ORDER BY turn_id DESC
+                      LIMIT %s
+                  )
+                """,
+                (conversation_key, conversation_key, HISTORY_MAX_TURNS),
+            )
+        connection.commit()
+
+
+def _clear_postgres_history_sync(conversation_key: str) -> None:
+    with _get_postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM conversation_history WHERE conversation_key = %s",
+                (conversation_key,),
+            )
+        connection.commit()
+
+
+def _initialize_history_store_sync() -> dict[str, deque[dict[str, str]]]:
+    if ACTIVE_HISTORY_BACKEND == "postgres":
+        _init_postgres_history_sync()
+        return _load_postgres_history_sync()
+    return _load_history_store_sync()
+
+
+def _build_conversation_key(message: discord.Message) -> str:
+    guild_id = message.guild.id if message.guild else "dm"
+    channel_id = message.channel.id
+    author_id = message.author.id
+    return f"{guild_id}:{channel_id}:{author_id}"
+
+
+def _build_history_context(conversation_key: str) -> str:
+    turns = conversation_history.get(conversation_key)
+    if not turns:
+        return ""
+
+    lines: list[str] = []
+    for index, turn in enumerate(turns, start=1):
+        user_text = turn.get("user", "").strip()
+        bot_text = turn.get("bot", "").strip()
+        if not user_text or not bot_text:
+            continue
+        lines.append(f"{index}. User: {user_text}")
+        lines.append(f"{index}. Grace: {bot_text}")
+    return "\n".join(lines)
+
+
+async def _build_recent_channel_context(message: discord.Message) -> str:
+    if CHANNEL_HISTORY_MESSAGES <= 0:
+        return ""
+
+    if not hasattr(message.channel, "history"):
+        return ""
+
+    context_lines: list[str] = []
+    try:
+        history_messages = [
+            item
+            async for item in message.channel.history(limit=CHANNEL_HISTORY_MESSAGES, before=message)
+        ]
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        return ""
+
+    for previous_message in reversed(history_messages):
+        content = (previous_message.content or "").strip()
+        if not content and previous_message.attachments:
+            content = f"[mengirim {len(previous_message.attachments)} attachment]"
+        if not content:
+            continue
+
+        author_name = previous_message.author.display_name
+        if previous_message.author == message.author:
+            author_name = "User"
+        elif client.user and previous_message.author.id == client.user.id:
+            author_name = BOT_NAME
+        context_lines.append(f"{author_name}: {content}")
+
+    return "\n".join(context_lines)
+
+
+async def _store_conversation_turn(conversation_key: str, user_text: str, bot_text: str) -> None:
+    normalized_user_text = (user_text or "").strip()
+    normalized_bot_text = (bot_text or "").strip()
+    if not normalized_user_text or not normalized_bot_text:
+        return
+
+    async with history_lock:
+        turns = conversation_history.setdefault(
+            conversation_key,
+            deque(maxlen=HISTORY_MAX_TURNS),
+        )
+        turns.append({"user": normalized_user_text, "bot": normalized_bot_text})
+        snapshot = {key: deque(value, maxlen=HISTORY_MAX_TURNS) for key, value in conversation_history.items()}
+    if ACTIVE_HISTORY_BACKEND == "postgres":
+        await asyncio.to_thread(
+            _save_postgres_turn_sync,
+            conversation_key,
+            normalized_user_text,
+            normalized_bot_text,
+        )
+        return
+    await asyncio.to_thread(_save_history_store_sync, snapshot)
+
+
+async def _clear_conversation_history(conversation_key: str) -> None:
+    async with history_lock:
+        conversation_history.pop(conversation_key, None)
+        snapshot = {key: deque(value, maxlen=HISTORY_MAX_TURNS) for key, value in conversation_history.items()}
+    if ACTIVE_HISTORY_BACKEND == "postgres":
+        await asyncio.to_thread(_clear_postgres_history_sync, conversation_key)
+        return
+    await asyncio.to_thread(_save_history_store_sync, snapshot)
+
+
+def _weather_code_to_text(code: Optional[int]) -> str:
+    weather_map = {
+        0: "cerah",
+        1: "sebagian cerah",
+        2: "berawan",
+        3: "mendung",
+        45: "berkabut",
+        48: "kabut beku",
+        51: "gerimis ringan",
+        53: "gerimis",
+        55: "gerimis lebat",
+        56: "gerimis beku ringan",
+        57: "gerimis beku lebat",
+        61: "hujan ringan",
+        63: "hujan sedang",
+        65: "hujan lebat",
+        66: "hujan beku ringan",
+        67: "hujan beku lebat",
+        71: "salju ringan",
+        73: "salju sedang",
+        75: "salju lebat",
+        77: "butiran salju",
+        80: "hujan lokal ringan",
+        81: "hujan lokal",
+        82: "hujan lokal lebat",
+        85: "salju lokal ringan",
+        86: "salju lokal lebat",
+        95: "badai petir",
+        96: "badai petir dan hujan es ringan",
+        99: "badai petir dan hujan es lebat",
+    }
+    return weather_map.get(code or 0, "kondisi tidak diketahui")
+
+
+def _http_get_json(url: str) -> dict[str, Any]:
+    with urlopen(url, timeout=15) as response:
+        return json.load(response)
+
+
+def _http_get_text(url: str) -> str:
+    with urlopen(url, timeout=15) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _extract_location_from_weather_prompt(prompt: str) -> tuple[str, bool]:
+    cleaned = re.sub(r"\s+", " ", (prompt or "").strip())
+    lowered = cleaned.lower()
+    patterns = [
+        r"(?:cuaca|weather|suhu|prakiraan cuaca)\s+(?:di|untuk|kota|daerah)\s+(.+)$",
+        r"(?:bagaimana|gimana)\s+cuaca\s+(?:di|untuk)\s+(.+)$",
+        r"(?:cuaca|weather)\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered, re.IGNORECASE)
+        if not match:
+            continue
+        location = cleaned[match.start(1):match.end(1)].strip(" ?!.,")
+        if location:
+            return location, False
+    return WEATHER_DEFAULT_LOCATION, True
+
+
+def is_weather_question(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    keywords = [
+        "cuaca",
+        "weather",
+        "suhu",
+        "temperatur",
+        "prakiraan cuaca",
+        "forecast",
+    ]
+    return any(keyword in p for keyword in keywords)
+
+
+def is_clear_history_command(prompt: str) -> bool:
+    p = (prompt or "").lower().strip()
+    commands = [
+        "hapus history",
+        "hapus riwayat",
+        "clear history",
+        "reset history",
+        "lupakan percakapan",
+        "hapus memori",
+        "clear memory",
+        "reset memory",
+    ]
+    return any(command in p for command in commands)
+
+
+def _fetch_weather_sync(location: str) -> dict[str, Any]:
+    geocode_url = (
+        "https://geocoding-api.open-meteo.com/v1/search"
+        f"?name={quote_plus(location)}&count=1&language=id&format=json"
+    )
+    geocode_data = _http_get_json(geocode_url)
+    results = geocode_data.get("results") or []
+    if not results:
+        raise ValueError(f"Lokasi '{location}' tidak ditemukan.")
+
+    best_match = results[0]
+    latitude = best_match.get("latitude")
+    longitude = best_match.get("longitude")
+    if latitude is None or longitude is None:
+        raise ValueError(f"Koordinat untuk '{location}' tidak tersedia.")
+
+    weather_url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={latitude}&longitude={longitude}"
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m"
+        "&timezone=auto"
+    )
+    weather_data = _http_get_json(weather_url)
+    current = weather_data.get("current") or {}
+    return {
+        "resolved_name": best_match.get("name") or location,
+        "admin1": best_match.get("admin1") or "",
+        "country": best_match.get("country") or "",
+        "timezone": weather_data.get("timezone") or "setempat",
+        "current": current,
+    }
+
+
+async def get_weather_reply(prompt: str) -> AIResult:
+    location, used_default = _extract_location_from_weather_prompt(prompt)
+    try:
+        weather = await asyncio.to_thread(_fetch_weather_sync, location)
+    except ValueError as exc:
+        return AIResult(str(exc), is_error=True)
+    except (HTTPError, URLError, TimeoutError):
+        return AIResult(
+            "Layanan cuaca sedang tidak bisa diakses. Coba lagi beberapa saat lagi.",
+            is_error=True,
+        )
+    except Exception:
+        return AIResult("Gagal mengambil data cuaca saat ini. Coba lagi sebentar ya.", is_error=True)
+
+    current = weather.get("current") or {}
+    resolved_name = weather.get("resolved_name", location)
+    admin1 = weather.get("admin1", "")
+    country = weather.get("country", "")
+    location_label = ", ".join(part for part in [resolved_name, admin1, country] if part)
+    condition = _weather_code_to_text(current.get("weather_code"))
+    intro = (
+        f"Saya pakai lokasi default {WEATHER_DEFAULT_LOCATION}. "
+        if used_default else ""
+    )
+    return AIResult(
+        (
+            f"{intro}Cuaca saat ini di {location_label}: {condition}. "
+            f"Suhu {current.get('temperature_2m', '-')}°C, terasa seperti {current.get('apparent_temperature', '-')}°C, "
+            f"kelembapan {current.get('relative_humidity_2m', '-')}%, "
+            f"angin {current.get('wind_speed_10m', '-')} km/jam, "
+            f"presipitasi {current.get('precipitation', '-')} mm. "
+            f"Zona waktu lokasi: {weather.get('timezone', 'setempat')}."
+        ).strip()
+    )
+
+
+def is_news_question(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    keywords = [
+        "berita",
+        "headline",
+        "news",
+        "kabar terbaru",
+        "top stories",
+        "berita populer",
+        "berita hari ini",
+    ]
+    return any(keyword in p for keyword in keywords)
+
+
+def _extract_news_topic(prompt: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (prompt or "").strip())
+    lowered = cleaned.lower()
+    patterns = [
+        r"(?:berita|headline|news|kabar terbaru)\s+(?:tentang|soal|mengenai)\s+(.+)$",
+        r"(?:berita|headline|news)\s+(.+)$",
+        r"top stories\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered, re.IGNORECASE)
+        if not match:
+            continue
+        topic = cleaned[match.start(1):match.end(1)].strip(" ?!.,")
+        if topic and topic.lower() not in {"hari ini", "terbaru", "populer", "sekarang"}:
+            return topic
+    return ""
+
+
+def _build_news_feed_url(topic: str = "") -> str:
+    if topic:
+        return (
+            "https://news.google.com/rss/search"
+            f"?q={quote_plus(topic)}&hl={NEWS_REGION_LANGUAGE}&gl={NEWS_REGION_COUNTRY}"
+            f"&ceid={NEWS_REGION_COUNTRY}:{NEWS_REGION_LANGUAGE}"
+        )
+    return (
+        "https://news.google.com/rss"
+        f"?hl={NEWS_REGION_LANGUAGE}&gl={NEWS_REGION_COUNTRY}&ceid={NEWS_REGION_COUNTRY}:{NEWS_REGION_LANGUAGE}"
+    )
+
+
+def _fetch_popular_news_sync(topic: str = "") -> list[dict[str, str]]:
+    raw_xml = _http_get_text(_build_news_feed_url(topic))
+    root = ElementTree.fromstring(raw_xml)
+    items: list[dict[str, str]] = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        if not title or not link:
+            continue
+        items.append({"title": title, "link": link, "pub_date": pub_date})
+        if len(items) >= NEWS_MAX_ITEMS:
+            break
+    return items
+
+
+async def get_news_reply(prompt: str) -> AIResult:
+    topic = _extract_news_topic(prompt)
+    try:
+        items = await asyncio.to_thread(_fetch_popular_news_sync, topic)
+    except (HTTPError, URLError, TimeoutError, ElementTree.ParseError):
+        return AIResult(
+            "Feed berita sedang tidak bisa diakses. Coba lagi beberapa saat lagi.",
+            is_error=True,
+        )
+    except Exception:
+        return AIResult("Gagal mengambil berita populer saat ini. Coba lagi sebentar ya.", is_error=True)
+
+    if not items:
+        if topic:
+            return AIResult(f"Belum ada berita yang ditemukan untuk topik '{topic}'.", is_error=True)
+        return AIResult("Belum ada berita populer yang bisa diambil saat ini.", is_error=True)
+
+    heading = f"Berita terbaru untuk topik {topic}:" if topic else "Berita populer saat ini:"
+    lines = [heading]
+    for index, item in enumerate(items, start=1):
+        lines.append(f"{index}. {item['title']}")
+        lines.append(f"   {item['link']}")
+    return AIResult("\n".join(lines))
 
 
 def _detect_vision_mode(prompt: str) -> str:
@@ -247,7 +777,7 @@ def build_datetime_reply() -> str:
     )
 
 
-async def ask_ai(user_prompt: str) -> AIResult:
+async def ask_ai(user_prompt: str, history_context: str = "", channel_context: str = "") -> AIResult:
     if not gemini_model:
         return AIResult(
             "GEMINI_API_KEY belum diset. Isi GEMINI_API_KEY di file .env agar Grace bisa menjawab dengan AI.",
@@ -266,10 +796,17 @@ async def ask_ai(user_prompt: str) -> AIResult:
             "Jawab dengan ramah, natural, jelas, dan tetap to the point. "
             "Gunakan bahasa Indonesia kecuali user meminta bahasa lain. "
             f"{datetime_context} "
+            "Jika tersedia, gunakan riwayat percakapan terbaru untuk menjaga konteks jawaban tetap nyambung, "
+            "tetapi prioritaskan pertanyaan user yang paling baru. "
             "Jika user menanyakan tanggal, hari, jam, atau waktu sekarang, gunakan konteks waktu tersebut sebagai acuan utama. "
             f"Jika user menanyakan siapa kamu, identitasmu, atau siapa pembuatmu, jawab secara konsisten dengan kalimat ini: {IDENTITY_TEXT}"
         )
-        full_prompt = f"{system_prompt}\n\nPertanyaan user: {user_prompt}"
+        history_section = f"Riwayat percakapan terbaru:\n{history_context}\n\n" if history_context else ""
+        channel_section = (
+            f"Pesan sebelumnya di channel yang relevan:\n{channel_context}\n\n"
+            if channel_context else ""
+        )
+        full_prompt = f"{system_prompt}\n\n{history_section}{channel_section}Pertanyaan user: {user_prompt}"
         async with gemini_lock:
             response = await asyncio.to_thread(
                 gemini_model.generate_content,
@@ -500,10 +1037,29 @@ async def _send_private_warning(user: discord.abc.User, text: str) -> None:
         return
 
 
+async def _reply_and_store(
+    message: discord.Message,
+    conversation_key: str,
+    user_prompt: str,
+    reply_text: str,
+) -> None:
+    await message.reply(reply_text)
+    await _store_conversation_turn(conversation_key, user_prompt, reply_text)
+
+
 @client.event
 async def on_ready() -> None:
     assert client.user is not None
-    print(f"Login sebagai {client.user} ({client.user.id})")
+    global conversation_history
+    try:
+        conversation_history = await asyncio.to_thread(_initialize_history_store_sync)
+    except Exception as exc:
+        print(f"Gagal menyiapkan storage history backend '{ACTIVE_HISTORY_BACKEND}': {exc}")
+        if ACTIVE_HISTORY_BACKEND != "file":
+            conversation_history = await asyncio.to_thread(_load_history_store_sync)
+        else:
+            conversation_history = {}
+    print(f"Login sebagai {client.user} ({client.user.id}) | history_backend={ACTIVE_HISTORY_BACKEND}")
 
 
 @client.event
@@ -523,6 +1079,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     prompt = normalize_prompt(message, me)
+    conversation_key = _build_conversation_key(message)
     images, image_error = await _extract_images(message)
     if image_error:
         await _send_private_warning(message.author, image_error)
@@ -530,16 +1087,37 @@ async def on_message(message: discord.Message) -> None:
 
     # Jika user hanya memanggil nama bot tanpa pertanyaan.
     if not prompt and not images:
-        await message.reply(IDENTITY_TEXT)
+        await _reply_and_store(message, conversation_key, BOT_NAME, IDENTITY_TEXT)
         return
 
     # Intro wajib ketika user bertanya identitas bot.
     if is_intro_question(prompt):
-        await message.reply(IDENTITY_TEXT)
+        await _reply_and_store(message, conversation_key, prompt, IDENTITY_TEXT)
+        return
+
+    if prompt and is_clear_history_command(prompt):
+        await _clear_conversation_history(conversation_key)
+        await message.reply("Riwayat percakapan kamu sudah saya hapus untuk konteks bot ini.")
         return
 
     if prompt and is_datetime_question(prompt):
-        await message.reply(build_datetime_reply())
+        await _reply_and_store(message, conversation_key, prompt, build_datetime_reply())
+        return
+
+    if prompt and is_weather_question(prompt):
+        weather_result = await get_weather_reply(prompt)
+        if weather_result.is_private_warning or weather_result.is_error:
+            await _send_private_warning(message.author, weather_result.text)
+            return
+        await _reply_and_store(message, conversation_key, prompt, weather_result.text)
+        return
+
+    if prompt and is_news_question(prompt):
+        news_result = await get_news_reply(prompt)
+        if news_result.is_private_warning or news_result.is_error:
+            await _send_private_warning(message.author, news_result.text)
+            return
+        await _reply_and_store(message, conversation_key, prompt, news_result.text)
         return
 
     ok, warning_text = _allow_request(message.author.id)
@@ -551,7 +1129,12 @@ async def on_message(message: discord.Message) -> None:
         if images:
             result = await ask_ai_with_images(prompt, images)
         else:
-            result = await ask_ai(prompt)
+            channel_context = await _build_recent_channel_context(message)
+            result = await ask_ai(
+                prompt,
+                _build_history_context(conversation_key),
+                channel_context,
+            )
     except Exception as exc:
         print(f"Error saat memproses pertanyaan: {exc}")
         result = AIResult("Maaf, terjadi error saat memproses pertanyaan. Coba lagi sebentar ya.", is_error=True)
@@ -567,7 +1150,12 @@ async def on_message(message: discord.Message) -> None:
         return
 
     try:
-        await message.reply(result.text)
+        stored_prompt = prompt.strip() or "Permintaan analisis gambar"
+        if images and prompt.strip():
+            stored_prompt = f"{prompt.strip()} [dengan gambar]"
+        elif images:
+            stored_prompt = "Permintaan analisis gambar"
+        await _reply_and_store(message, conversation_key, stored_prompt, result.text)
     except discord.HTTPException:
         await _send_private_warning(
             message.author,
