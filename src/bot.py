@@ -4,7 +4,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
@@ -20,6 +20,8 @@ BOT_NAME = os.getenv("BOT_NAME", "Grace")
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Jakarta")
 GLOBAL_RPM_LIMIT = max(1, int(os.getenv("GLOBAL_RPM_LIMIT", "4")))
 USER_COOLDOWN_SEC = max(1.0, float(os.getenv("USER_COOLDOWN_SEC", "8")))
+MAX_IMAGE_BYTES = max(1, int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024))))
+MAX_IMAGES_PER_REQUEST = max(1, int(os.getenv("MAX_IMAGES_PER_REQUEST", "3")))
 
 IDENTITY_TEXT = (
     "Saya adalah Grace, asisten AI DPNP yang dibuat oleh Brann. "
@@ -46,6 +48,41 @@ class AIResult:
     text: str
     is_private_warning: bool = False
     is_error: bool = False
+
+
+@dataclass
+class ImagePayload:
+    data: bytes
+    mime_type: str
+    filename: str
+
+
+def _detect_vision_mode(prompt: str) -> str:
+    p = (prompt or "").lower()
+    ocr_keywords = [
+        "ocr",
+        "baca teks",
+        "extract text",
+        "ekstrak teks",
+        "salin teks",
+        "transkrip",
+        "transcribe",
+        "copy text",
+    ]
+    summary_keywords = [
+        "ringkas visual",
+        "summary visual",
+        "ringkasan visual",
+        "format poin",
+        "bullet",
+        "objek utama",
+        "apa yang terlihat",
+    ]
+    if any(k in p for k in ocr_keywords):
+        return "ocr"
+    if any(k in p for k in summary_keywords):
+        return "summary"
+    return "default"
 
 
 def _has_name_trigger(text: str) -> bool:
@@ -276,6 +313,163 @@ async def ask_ai(user_prompt: str) -> AIResult:
     return AIResult(answer)
 
 
+async def ask_ai_with_images(user_prompt: str, images: list[ImagePayload]) -> AIResult:
+    if not gemini_model:
+        return AIResult(
+            "GEMINI_API_KEY belum diset. Isi GEMINI_API_KEY di file .env agar Grace bisa membaca gambar.",
+            is_error=True,
+        )
+    if not GEMINI_API_KEY.startswith("AIza"):
+        return AIResult(
+            "GEMINI_API_KEY tidak valid. Gunakan API key dari Google AI Studio (biasanya berawalan 'AIza').",
+            is_error=True,
+        )
+
+    if not images:
+        return AIResult("Tidak ada gambar yang bisa diproses.", is_error=True)
+
+    try:
+        datetime_context = _get_current_datetime_context()
+        system_prompt = (
+            "Kamu adalah Grace, asisten AI DPNP yang dibuat oleh Brann. "
+            "Jawab dengan ramah, natural, jelas, dan tetap to the point. "
+            "Gunakan bahasa Indonesia kecuali user meminta bahasa lain. "
+            f"{datetime_context} "
+            "Kamu bisa membaca dan menganalisis gambar dari user. "
+            "Jika detail gambar tidak terlihat jelas, jelaskan keterbatasan pengamatan secara jujur. "
+            "Jika user menanyakan tanggal, hari, jam, atau waktu sekarang, gunakan konteks waktu tersebut sebagai acuan utama. "
+            f"Jika user menanyakan siapa kamu, identitasmu, atau siapa pembuatmu, jawab secara konsisten dengan kalimat ini: {IDENTITY_TEXT}"
+        )
+
+        effective_prompt = user_prompt.strip() or "Tolong jelaskan isi gambar ini secara ringkas dan jelas."
+        mode = _detect_vision_mode(effective_prompt)
+        mode_instruction = ""
+        if mode == "ocr":
+            mode_instruction = (
+                "Mode OCR aktif. Fokus menyalin teks yang terlihat di gambar seakurat mungkin. "
+                "Pertahankan urutan baris. Jika ada bagian yang tidak terbaca, tulis [tidak terbaca]."
+            )
+        elif mode == "summary":
+            mode_instruction = (
+                "Mode ringkasan visual aktif. Jawab dalam format poin dengan struktur: "
+                "1) Objek utama, 2) Teks yang terlihat, 3) Konteks/aktivitas, 4) Ketidakpastian."
+            )
+
+        text_part = (
+            f"{system_prompt}\n\n"
+            f"Instruksi mode: {mode_instruction or 'Mode normal analisis visual.'}\n"
+            f"Instruksi user: {effective_prompt}"
+        )
+        content_parts: list[Any] = [text_part]
+        for image in images:
+            content_parts.append({"mime_type": image.mime_type, "data": image.data})
+
+        async with gemini_lock:
+            response = await asyncio.to_thread(
+                gemini_model.generate_content,
+                content_parts,
+                generation_config={"temperature": 0.6},
+            )
+    except Exception as exc:
+        err = str(exc).lower()
+        if "api key" in err or "permission" in err or "unauth" in err:
+            return AIResult(
+                "GEMINI_API_KEY tidak valid atau belum punya izin. Cek key di Google AI Studio.",
+                is_error=True,
+            )
+        if "quota" in err or "rate" in err or "429" in err or "resource_exhausted" in err:
+            return AIResult(
+                "Limit Gemini API sedang tercapai. Coba lagi beberapa saat lagi.",
+                is_private_warning=True,
+                is_error=True,
+            )
+        return AIResult("Gagal memproses gambar di Gemini. Coba lagi sebentar ya.", is_error=True)
+
+    try:
+        answer = getattr(response, "text", "") or ""
+    except Exception as exc:
+        err = str(exc).lower()
+        if "quota" in err or "rate" in err or "429" in err or "resource_exhausted" in err:
+            return AIResult(
+                "Limit Gemini API sedang tercapai. Coba lagi beberapa saat lagi.",
+                is_private_warning=True,
+                is_error=True,
+            )
+        if "safety" in err or "blocked" in err:
+            return AIResult("Analisis gambar dibatasi oleh safety Gemini. Coba gambar lain ya.", is_error=True)
+        return AIResult("Gemini mengembalikan respons kosong untuk gambar. Coba lagi dengan instruksi yang lebih spesifik.", is_error=True)
+
+    answer = answer.strip()
+    if not answer:
+        return AIResult("Gemini mengembalikan respons kosong untuk gambar. Coba lagi dengan instruksi yang lebih spesifik.", is_error=True)
+    if len(answer) > 1900:
+        answer = answer[:1900] + "\n\n...[jawaban dipotong karena terlalu panjang]"
+    return AIResult(answer)
+
+
+async def _extract_images(message: discord.Message) -> tuple[list[ImagePayload], Optional[str]]:
+    async def _collect_from_attachments(
+        attachments: list[discord.Attachment],
+        images: list[ImagePayload],
+    ) -> Optional[str]:
+        for attachment in attachments:
+            if len(images) >= MAX_IMAGES_PER_REQUEST:
+                break
+            content_type = (attachment.content_type or "").lower()
+            is_image_mime = content_type.startswith("image/")
+            is_image_ext = attachment.filename.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif")
+            )
+            if not (is_image_mime or is_image_ext):
+                continue
+            if attachment.size and attachment.size > MAX_IMAGE_BYTES:
+                return (
+                    f"Ukuran gambar `{attachment.filename}` terlalu besar. "
+                    f"Maksimal {MAX_IMAGE_BYTES // (1024 * 1024)} MB per gambar."
+                )
+
+            try:
+                data = await attachment.read()
+            except (discord.HTTPException, discord.Forbidden):
+                return f"Gagal membaca file gambar `{attachment.filename}`. Coba upload ulang ya."
+
+            mime_type = content_type if is_image_mime else "image/jpeg"
+            images.append(
+                ImagePayload(
+                    data=data,
+                    mime_type=mime_type,
+                    filename=attachment.filename,
+                )
+            )
+        return None
+
+    images: list[ImagePayload] = []
+    current_error = await _collect_from_attachments(message.attachments, images)
+    if current_error:
+        return [], current_error
+
+    if len(images) >= MAX_IMAGES_PER_REQUEST:
+        return images, None
+
+    referenced_message: Optional[discord.Message] = None
+    if message.reference and isinstance(message.reference.resolved, discord.Message):
+        referenced_message = message.reference.resolved
+    elif message.reference and message.reference.message_id and message.channel:
+        try:
+            fetched = await message.channel.fetch_message(message.reference.message_id)
+            if isinstance(fetched, discord.Message):
+                referenced_message = fetched
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+            referenced_message = None
+
+    if referenced_message and referenced_message.attachments:
+        reply_error = await _collect_from_attachments(referenced_message.attachments, images)
+        if reply_error:
+            return [], reply_error
+
+    return images, None
+
+
 def _allow_request(user_id: int) -> tuple[bool, Optional[str]]:
     now = time.time()
     cutoff = now - 60
@@ -329,9 +523,13 @@ async def on_message(message: discord.Message) -> None:
         return
 
     prompt = normalize_prompt(message, me)
+    images, image_error = await _extract_images(message)
+    if image_error:
+        await _send_private_warning(message.author, image_error)
+        return
 
     # Jika user hanya memanggil nama bot tanpa pertanyaan.
-    if not prompt:
+    if not prompt and not images:
         await message.reply(IDENTITY_TEXT)
         return
 
@@ -340,7 +538,7 @@ async def on_message(message: discord.Message) -> None:
         await message.reply(IDENTITY_TEXT)
         return
 
-    if is_datetime_question(prompt):
+    if prompt and is_datetime_question(prompt):
         await message.reply(build_datetime_reply())
         return
 
@@ -350,7 +548,10 @@ async def on_message(message: discord.Message) -> None:
         return
 
     try:
-        result = await ask_ai(prompt)
+        if images:
+            result = await ask_ai_with_images(prompt, images)
+        else:
+            result = await ask_ai(prompt)
     except Exception as exc:
         print(f"Error saat memproses pertanyaan: {exc}")
         result = AIResult("Maaf, terjadi error saat memproses pertanyaan. Coba lagi sebentar ya.", is_error=True)

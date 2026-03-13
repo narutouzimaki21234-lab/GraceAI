@@ -10,6 +10,9 @@ Fitur:
   - `Saya adalah Grace, asisten AI DPNP yang dibuat oleh Brann. Saya siap membantu menjawab pertanyaan dan memberikan penjelasan dengan jelas.`
 - Mengetahui tanggal, jam, dan periode waktu saat ini secara real-time, termasuk konteks seperti dini hari, pagi, siang, sore, atau malam.
 - Menjawab pertanyaan user dengan AI (Gemini API).
+- Dapat membaca dan menganalisis gambar yang diunggah user (attachment image) menggunakan Gemini Vision.
+- Bisa mengambil gambar dari pesan yang sedang di-reply (reply message) untuk dianalisis.
+- Mendukung mode OCR (ekstrak teks dari gambar) dan mode ringkasan visual terstruktur.
 
 ## 1) Setup
 
@@ -43,6 +46,8 @@ Fitur:
    - `BOT_TIMEZONE=Asia/Jakarta` (opsional)
    - `GLOBAL_RPM_LIMIT=4` (opsional)
    - `USER_COOLDOWN_SEC=8` (opsional)
+   - `MAX_IMAGE_BYTES=8388608` (opsional, default 8MB per gambar)
+   - `MAX_IMAGES_PER_REQUEST=3` (opsional, default maksimal 3 gambar per request)
 6. Deploy service, lalu cek tab logs sampai muncul pesan login bot Discord.
 
 Catatan:
@@ -60,6 +65,18 @@ Catatan:
   - `Grace, sekarang jam berapa?`
   - `Grace, sekarang tanggal berapa?`
   - `@Grace tolong jelaskan Python`
+  - `Grace, tolong jelaskan gambar ini` sambil upload gambar
+  - `@Grace apa yang kamu lihat di gambar ini?` sambil upload gambar
+  - Reply ke pesan yang berisi gambar: `Grace, jelaskan gambar ini`
+  - OCR: `Grace, OCR gambar ini` atau `Grace, baca teks pada gambar ini`
+  - Ringkasan visual: `Grace, ringkas visual gambar ini dengan format poin`
+
+Catatan fitur gambar:
+
+- Gambar diproses dari file attachment Discord (png/jpg/jpeg/webp/gif/bmp/heic/heif).
+- Grace juga bisa membaca gambar dari pesan yang Anda reply, bukan hanya attachment di pesan saat ini.
+- Jika pesan hanya berisi gambar tanpa teks, Grace akan tetap menganalisis gambar dengan instruksi default.
+- Jika ukuran gambar melebihi batas, Grace akan mengirim peringatan via DM.
 
 ## 4) Dapatkan Gemini API Key
 
