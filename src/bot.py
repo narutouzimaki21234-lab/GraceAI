@@ -580,11 +580,26 @@ async def get_news_reply(prompt: str) -> AIResult:
         return AIResult("Belum ada berita populer yang bisa diambil saat ini.", is_error=True)
 
     heading = f"Berita terbaru untuk topik {topic}:" if topic else "Berita populer saat ini:"
-    lines = [heading]
+    DISCORD_LIMIT = 1950
+    result_lines = [heading]
+    current_length = len(heading)
+
     for index, item in enumerate(items, start=1):
-        lines.append(f"{index}. {item['title']}")
-        lines.append(f"   {item['link']}")
-    return AIResult("\n".join(lines))
+        title_line = f"{index}. {item['title']}"
+        # Potong URL supaya tidak meledakkan panjang pesan.
+        raw_link = item["link"]
+        max_link_len = 100
+        link_display = raw_link if len(raw_link) <= max_link_len else raw_link[:max_link_len] + "..."
+        link_line = f"   {link_display}"
+
+        entry = f"\n{title_line}\n{link_line}"
+        if current_length + len(entry) > DISCORD_LIMIT:
+            break
+        result_lines.append(title_line)
+        result_lines.append(link_line)
+        current_length += len(entry)
+
+    return AIResult("\n".join(result_lines))
 
 
 def _detect_vision_mode(prompt: str) -> str:
