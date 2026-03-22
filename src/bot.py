@@ -75,6 +75,12 @@ class ImagePayload:
     filename: str
 
 
+@dataclass
+class ChannelDispatchCommand:
+    channel: discord.TextChannel
+    content: str
+
+
 conversation_history: dict[str, deque[dict[str, str]]] = {}
 history_lock = asyncio.Lock()
 
@@ -636,6 +642,166 @@ async def get_news_reply(prompt: str) -> AIResult:
     return AIResult("\n".join(result_lines))
 
 
+def _is_channel_dispatch_request(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    if "channel" not in p and "kanal" not in p:
+        return False
+    verbs = [
+        "chat",
+        "kirim",
+        "pesan",
+        "bilang",
+        "katakan",
+        "suruh",
+        "tag",
+        "mention",
+        "ping",
+        "ucapkan",
+        "selamat",
+        "ultah",
+        "ulang tahun",
+        "birthday",
+        "hbd",
+    ]
+    return any(verb in p for verb in verbs)
+
+
+def _is_birthday_request(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    keywords = ["ultah", "ulang tahun", "birthday", "hbd", "selamat ulang tahun"]
+    return any(keyword in p for keyword in keywords)
+
+
+def _find_text_channel_by_name(guild: discord.Guild, raw_name: str) -> Optional[discord.TextChannel]:
+    normalized = raw_name.strip().lstrip("#").lower()
+    if not normalized:
+        return None
+
+    for channel in guild.text_channels:
+        channel_name = channel.name.lower()
+        if channel_name == normalized:
+            return channel
+        if channel_name.replace("-", " ") == normalized.replace("-", " "):
+            return channel
+    return None
+
+
+def _build_channel_dispatch_command(
+    prompt: str,
+    guild: Optional[discord.Guild],
+) -> tuple[Optional[ChannelDispatchCommand], Optional[str]]:
+    if guild is None:
+        return None, "Perintah kirim ke channel hanya bisa dipakai di server, bukan di DM."
+
+    text = (prompt or "").strip()
+    if not text:
+        return None, "Tulis dulu perintah yang ingin dikirim ke channel tujuan."
+
+    channel: Optional[discord.TextChannel] = None
+    remaining = text
+
+    channel_mention_match = re.search(r"<#(\d+)>", text)
+    if channel_mention_match:
+        channel_id = int(channel_mention_match.group(1))
+        candidate = guild.get_channel(channel_id)
+        if isinstance(candidate, discord.TextChannel):
+            channel = candidate
+            remaining = text[channel_mention_match.end():].strip()
+        else:
+            return None, "Channel tujuan tidak ditemukan atau bukan channel teks."
+    else:
+        channel_name_match = re.search(
+            (
+                r"(?:di|ke)\s*(?:channel|kanal)\s+([a-zA-Z0-9_\-# ]+?)"
+                r"(?=\s+(?:dan\s+)?(?:tag|mention|ping|pesan|message|isi|bilang|katakan)\b|$)"
+            ),
+            text,
+            re.IGNORECASE,
+        )
+        if not channel_name_match:
+            return None, (
+                "Format belum jelas. Contoh: `Grace, kirim ke channel yapping pesan: halo <@123456789>` "
+                "atau gunakan mention channel seperti `<#ID_CHANNEL>`."
+            )
+
+        raw_name = channel_name_match.group(1).strip(" ,.!?")
+        channel = _find_text_channel_by_name(guild, raw_name)
+        if channel is None:
+            return None, f"Saya tidak menemukan channel `{raw_name}` di server ini."
+        remaining = text[channel_name_match.end():].strip()
+
+    birthday_mode = _is_birthday_request(text)
+    mention_tokens = re.findall(r"<@!?\d+>", text)
+    # Buang segmen 'tag/mention/ping ...' agar tidak ikut dikirim sebagai teks mentah.
+    remaining = re.sub(
+        r"(?:\bdan\b\s*)?(?:tag|mention|ping)\b.*?(?=(?:\bpesan\b|\bmessage\b|\bisi\b|\bbilang\b|\bkatakan\b)\b|$)",
+        " ",
+        remaining,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    message_match = re.search(
+        r"(?:\bpesan\b|\bmessage\b|\bisi\b|\bbilang\b|\bkatakan\b)\s*[:\-]?\s*(.+)$",
+        remaining,
+        re.IGNORECASE,
+    )
+    raw_body = message_match.group(1).strip() if message_match else remaining.strip(" ,.-")
+    raw_body = re.sub(r"^(?:untuk|buat|ke)\s+", "", raw_body, flags=re.IGNORECASE).strip()
+    body = re.sub(r"<@!?\d+>", "", raw_body).strip(" ,.-")
+
+    if birthday_mode and not body:
+        body = "Selamat ulang tahun! Semoga panjang umur, sehat selalu, dan semua harapan baikmu tercapai."
+
+    mention_prefix = " ".join(dict.fromkeys(mention_tokens)).strip()
+    final_content = " ".join(part for part in [mention_prefix, body] if part).strip()
+    if not final_content:
+        return None, (
+            "Isi pesannya belum ada. Contoh: `Grace, kirim ke channel yapping tag <@123> pesan: halo`"
+        )
+
+    if len(final_content) > 1900:
+        return None, "Pesan terlalu panjang untuk dikirim ke Discord (maksimal sekitar 2000 karakter)."
+
+    return ChannelDispatchCommand(channel=channel, content=final_content), None
+
+
+async def _handle_channel_dispatch_command(
+    message: discord.Message,
+    conversation_key: str,
+    prompt: str,
+) -> bool:
+    if not _is_channel_dispatch_request(prompt):
+        return False
+
+    command, error_text = _build_channel_dispatch_command(prompt, message.guild)
+    if error_text:
+        await message.reply(error_text)
+        return True
+    if command is None:
+        return True
+
+    permissions = command.channel.permissions_for(message.guild.me) if message.guild else None
+    if not permissions or not permissions.view_channel or not permissions.send_messages:
+        await message.reply(
+            f"Saya tidak punya izin kirim pesan di channel {command.channel.mention}."
+        )
+        return True
+
+    try:
+        await command.channel.send(
+            command.content,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except discord.HTTPException:
+        await message.reply("Gagal mengirim pesan ke channel tujuan. Coba lagi sebentar ya.")
+        return True
+
+    confirmation = f"Siap, pesannya sudah saya kirim ke {command.channel.mention}."
+    await message.reply(confirmation)
+    await _store_conversation_turn(conversation_key, prompt, confirmation)
+    return True
+
+
 def _detect_vision_mode(prompt: str) -> str:
     p = (prompt or "").lower()
     ocr_keywords = [
@@ -1142,6 +1308,9 @@ async def on_message(message: discord.Message) -> None:
     # Intro wajib ketika user bertanya identitas bot.
     if is_intro_question(prompt):
         await _reply_and_store(message, conversation_key, prompt, IDENTITY_TEXT)
+        return
+
+    if prompt and await _handle_channel_dispatch_command(message, conversation_key, prompt):
         return
 
     if prompt and is_clear_history_command(prompt):

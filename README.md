@@ -12,6 +12,7 @@ Fitur:
 - Menyimpan riwayat percakapan terbaru per user secara persisten agar jawaban lanjutan tetap nyambung.
 - Membaca beberapa pesan sebelumnya di channel sebagai konteks tambahan sebelum menjawab.
 - Menjawab pertanyaan user dengan AI (Gemini API).
+- Bisa menjalankan perintah untuk mengirim chat ke channel lain (misalnya channel `yapping`) dan men-tag user tertentu.
 - Membaca cuaca real-time berdasarkan lokasi yang diminta user.
 - Mengambil berita populer terbaru secara real-time dari feed berita.
 - Siap memakai PostgreSQL Railway melalui `DATABASE_URL` agar history tetap aman saat redeploy.
@@ -84,6 +85,11 @@ Catatan:
 - `Grace, headline terbaru`
 - `Grace, berita teknologi`
 - `Grace, berita tentang AI`
+   - `Grace, kirim ke channel yapping tag @username pesan: halo, ayo ngobrol di sini`
+   - `Grace, chat di channel #yapping pesan: @username ada info baru ya`
+   - `Grace, kirim ke channel <#123456789012345678> pesan: tes pesan lintas channel`
+   - `Grace, ucapkan ultah ke channel yapping untuk @username`
+   - `Grace, kirim ke channel yapping tag @username pesan: selamat ulang tahun!`
 - `Grace, hapus history`
   - `@Grace tolong jelaskan Python`
   - `Grace, tolong jelaskan gambar ini` sambil upload gambar
